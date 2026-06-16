@@ -1,0 +1,10 @@
+title       = "marvel"
+baseURL     = "https://marvel-cli.tamnd.com/"
+description = "Read the Marvel Comics API"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/marvel-cli"
