@@ -2,76 +2,103 @@ package marvel
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes marvel as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/marvel-cli/marvel"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// marvel:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone marvel binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// init registers the Domain so a blank import in a multi-domain host enables
+// the marvel:// driver.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the marvel driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the Marvel Comics API driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hosts, and identity for the kit framework.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "marvel",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, GatewayHost, "www.marvel.com", "marvel.com"},
 		Identity: kit.Identity{
 			Binary: "marvel",
 			Short:  "Read the Marvel Comics API",
-			Long: `Read the Marvel Comics API
+			Long: `marvel reads the official Marvel Comics developer API.
 
-marvel reads public marvel data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Requires two environment variables:
+  MARVEL_PUBLIC_KEY   your public key from developer.marvel.com
+  MARVEL_PRIVATE_KEY  your private key for request signing
+
+Quick start:
+  marvel characters -n 10                    list 10 characters
+  marvel characters --name-starts-with Spi   characters starting with "Spi"
+  marvel character 1011334                   fetch 3-D Man
+  marvel comics -n 5                         list 5 comics
+  marvel comic 82967                         fetch a comic by id
+  marvel search spider                       search characters and comics
+
+Data provided by Marvel. (c) 2024 MARVEL`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/marvel-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and all operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `marvel page` and
-	// `ant get marvel://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "characters",
+		Group:   "characters",
+		List:    true,
+		Summary: "List Marvel characters",
+	}, listCharacters)
 
-	// List op: members of a page, the home of `marvel links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// marvel://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "character",
+		Group:    "characters",
+		Single:   true,
+		Resolver: true,
+		URIType:  "character",
+		Summary:  "Fetch a single character by ID",
+		Args:     []kit.Arg{{Name: "id", Help: "character id (numeric)"}},
+	}, getCharacter)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "comics",
+		Group:   "comics",
+		List:    true,
+		Summary: "List Marvel comics",
+	}, listComics)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:     "comic",
+		Group:    "comics",
+		Single:   true,
+		Resolver: true,
+		URIType:  "comic",
+		Summary:  "Fetch a single comic by ID",
+		Args:     []kit.Arg{{Name: "id", Help: "comic id (numeric)"}},
+	}, getComic)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "search",
+		List:    true,
+		Summary: "Search characters and comics by name/title prefix",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}},
+	}, searchAll)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the kit-resolved Config and environment variables.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
+	c.FromEnv()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +109,178 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	client, err := NewClient(c)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type listCharactersInput struct {
+	Limit          int     `kit:"flag,inherit" help:"max results" default:"20"`
+	NameStartsWith string  `kit:"flag" help:"name prefix filter"`
+	Client         *Client `kit:"inject"`
+}
+
+type characterInput struct {
+	ID     string  `kit:"arg" help:"character id (numeric)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type listComicsInput struct {
+	Limit           int     `kit:"flag,inherit" help:"max results" default:"20"`
+	TitleStartsWith string  `kit:"flag" help:"title prefix filter"`
+	Client          *Client `kit:"inject"`
+}
+
+type comicInput struct {
+	ID     string  `kit:"arg" help:"comic id (numeric)"`
+	Client *Client `kit:"inject"`
+}
+
+type searchInput struct {
+	Query  string  `kit:"arg" help:"search query"`
+	Limit  int     `kit:"flag,inherit" help:"max per kind" default:"10"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listCharacters(ctx context.Context, in listCharactersInput, emit func(Character) error) error {
+	chars, err := in.Client.ListCharacters(ctx, ListCharactersOpts{
+		Limit:          in.Limit,
+		NameStartsWith: in.NameStartsWith,
+	})
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
+	if len(chars) == 0 {
+		return errs.NotFound("no characters found")
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, ch := range chars {
+		if err := emit(ch); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func getCharacter(ctx context.Context, in characterInput, emit func(*Character) error) error {
+	id, err := strconv.Atoi(in.ID)
+	if err != nil {
+		return errs.Usage("character id must be numeric, got %q", in.ID)
+	}
+	ch, err := in.Client.GetCharacter(ctx, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(ch)
+}
 
-// Classify turns any accepted input — a bare path or a full marvel.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func listComics(ctx context.Context, in listComicsInput, emit func(Comic) error) error {
+	comics, err := in.Client.ListComics(ctx, ListComicsOpts{
+		Limit:           in.Limit,
+		TitleStartsWith: in.TitleStartsWith,
+	})
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(comics) == 0 {
+		return errs.NotFound("no comics found")
+	}
+	for _, cm := range comics {
+		if err := emit(cm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getComic(ctx context.Context, in comicInput, emit func(*Comic) error) error {
+	id, err := strconv.Atoi(in.ID)
+	if err != nil {
+		return errs.Usage("comic id must be numeric, got %q", in.ID)
+	}
+	cm, err := in.Client.GetComic(ctx, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(cm)
+}
+
+func searchAll(ctx context.Context, in searchInput, emit func(SearchResult) error) error {
+	results, err := in.Client.Search(ctx, in.Query, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(results) == 0 {
+		return errs.NotFound("no results for %q", in.Query)
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify turns any accepted input into the canonical (uriType, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized marvel reference: %q", input)
-	}
-	return "page", id, nil
-}
-
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("marvel has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
 	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+	if input == "" {
+		return "", "", errs.Usage("marvel: empty input")
 	}
-	return strings.Trim(input, "/")
+	// comic:<id>
+	if strings.HasPrefix(input, "comic:") {
+		return "comic", strings.TrimPrefix(input, "comic:"), nil
+	}
+	// full URL: https://gateway.marvel.com/v1/public/characters/1011334
+	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+		for i, s := range segs {
+			if (s == "characters" || s == "comics") && i+1 < len(segs) {
+				utype := "character"
+				if s == "comics" {
+					utype = "comic"
+				}
+				return utype, segs[i+1], nil
+			}
+		}
+	}
+	// numeric default to character
+	return "character", input, nil
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// Locate returns the canonical web URL for a (uriType, id).
+func (Domain) Locate(uriType, id string) (string, error) {
+	switch uriType {
+	case "character":
+		return fmt.Sprintf("https://www.marvel.com/characters/%s", id), nil
+	case "comic":
+		return fmt.Sprintf("https://gateway.marvel.com/v1/public/comics/%s", id), nil
+	}
+	return "", errs.Usage("marvel has no resource type %q", uriType)
+}
+
+// mapErr converts library errors into kit error kinds with appropriate exit codes.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
+	if errors.Is(err, ErrRateLimited) {
+		return errs.RateLimited("%s", err.Error())
+	}
+	if errors.Is(err, ErrMissingKeys) {
+		return errs.Usage("%s", err.Error())
+	}
 	return err
 }
